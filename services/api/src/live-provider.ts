@@ -126,39 +126,55 @@ export class OpenAILiveProvider implements LiveProvider {
     return new Promise((resolve, reject) => {
       const socket = new WebSocket(url, { headers: { Authorization: `Bearer ${this.key}` },
         handshakeTimeout: this.timeout, maxPayload: 524_288, perMessageDeflate: false, followRedirects: false });
-      let intentional = false, opened = false, lossReported = false;
+      let intentional = false, opened = false, lossReported = false, finalized = false, closeSent = false;
       let pongAt = Date.now();
       const heartbeat = setInterval(() => {
         if (!opened) return;
-        if (Date.now() - pongAt > 15_000) { lost(); socket.terminate(); }
+        if (Date.now() - pongAt > 15_000) { lost('provider_heartbeat_timeout'); socket.terminate(); }
         else if (socket.readyState === WebSocket.OPEN) socket.ping();
       }, 5_000);
       heartbeat.unref();
       socket.on('pong', () => { pongAt = Date.now(); });
-      const lost = () => { if (!intentional && !lossReported) { lossReported = true; onLoss(); } };
-      socket.on('error', () => { if (!opened) reject(new ServiceError('provider_attach_failed', 502)); lost(); });
-      socket.on('close', () => { clearInterval(heartbeat); if (!opened) reject(new ServiceError('provider_attach_failed', 502)); lost(); });
+      const lost = (code: string, providerStatus?: number) => {
+        if (!intentional && !finalized && !lossReported) {
+          lossReported = true;
+          this.diagnostics.record('provider_failed', { operation: 'voice.attach', providerStatus }, new ServiceError(code, 502));
+          onLoss();
+        }
+      };
+      socket.on('unexpected-response', (_request, response) => {
+        response.resume();
+        reject(new ServiceError('provider_attach_failed', 502));
+        lost('provider_attach_failed', response.statusCode); clearInterval(heartbeat); socket.terminate();
+      });
+      socket.on('error', () => { if (!opened) reject(new ServiceError('provider_attach_failed', 502)); lost('provider_socket_error'); });
+      socket.on('close', () => { clearInterval(heartbeat); if (!opened) reject(new ServiceError('provider_attach_failed', 502)); lost('provider_socket_closed'); });
       socket.on('message', (bytes, binary) => {
         try {
           if (binary) throw new Error();
           const event = JSON.parse(bytes.toString());
-          // GPT-Live rejects queued context when closing begins. This command failure
-          // is not a transport failure: keep the receiver alive for session.closed.
-          if (event.type === 'error' && event.error?.code === 'context_injection_incomplete') return;
-          if (event.type === 'error') throw new Error();
+          // Command rejection and moderation errors can precede session.closed.
+          // They never prove a transport failure or final usage. Keep draining.
+          if (event.type === 'error') {
+            this.diagnostics.record('provider_failed', { operation: 'voice.command' }, new ServiceError('provider_command_rejected', 502));
+            return;
+          }
           // Reflected audio, transcripts, prompts and session snapshots are discarded here.
           if (event.type !== 'session.usage.updated' && event.type !== 'session.closed') return;
           const seconds = event.usage?.seconds;
           if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0 || seconds > Number.MAX_SAFE_INTEGER / 1000) throw new Error();
           if (event.session?.id !== undefined && event.session.id !== sessionID) throw new Error();
           onUsage({ type: event.type, usage: { seconds } });
-        } catch { lost(); socket.terminate(); }
+          if (event.type === 'session.closed') { finalized = true; clearInterval(heartbeat); }
+        } catch { lost('invalid_provider_usage'); socket.terminate(); }
       });
       socket.once('open', () => {
         opened = true;
         resolve({ closeSession() {
+          if (closeSent || finalized) return;
           if (socket.readyState !== WebSocket.OPEN) throw new ServiceError('provider_connection_lost', 502);
           socket.send(JSON.stringify({ type: 'session.close', event_id: randomUUID() }));
+          closeSent = true;
         }, disconnect() { intentional = true; socket.terminate(); } });
       });
     });

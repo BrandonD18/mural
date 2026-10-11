@@ -38,8 +38,8 @@ try {
   const appleRevoker = appleClient && appleTeam && appleKey && appleFile ? new AppleTokenRevoker(db,
     { clientID: appleClient, teamID: appleTeam, keyID: appleKey, privateKeyPEM: await readFile(appleFile, 'utf8') }) : undefined;
   await appleRevoker?.validateConfiguration();
-  minuteCommerce = await configuredMinuteCommerce(db, process.env, { onFailure: (code, providerStatus) =>
-    diagnostics.record('background_failed', { operation: 'commerce.reconcile', providerStatus }, new ServiceError(code)),
+  minuteCommerce = await configuredMinuteCommerce(db, process.env, { onFailure: (code, providerStatus, scope) =>
+    diagnostics.record('background_failed', { operation: scope ? `commerce.reconcile.${scope.provider}.${scope.environment}` : 'commerce.reconcile', providerStatus }, new ServiceError(code)),
     onPlayNotificationHandled: eventType => diagnostics.record('provider_completed', { operation: `play.notification.${eventType}` }) });
   const deploymentEnvironment=(await db.query('SELECT environment FROM deployment_environment WHERE singleton')).rows[0]?.environment;
   if (!['live','test'].includes(deploymentEnvironment)) throw new Error('Missing deployment environment.');

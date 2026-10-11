@@ -6,19 +6,46 @@ import type { AppleMinuteProvider } from './apple-minute-provider.js';
 import { PlayNotificationTransportError, type PlayRtdnSubscriber } from './google-play-rtdn.js';
 
 const day = 86_400_000;
+export function reconciliationProviderStatus(error: unknown): number | undefined {
+  if (!error || typeof error !== 'object') return;
+  const value = 'httpStatusCode' in error ? error.httpStatusCode : 'providerStatus' in error ? error.providerStatus : undefined;
+  return typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599 ? value : undefined;
+}
 export interface CommerceRunnerOptions {
   intervalMilliseconds?: number;
   deliveryLimit?: number;
   reconciliationLimit?: number;
   voidPagesPerRun?: number;
   onFailure?: (code: 'minute_delivery_failed' | 'minute_reconciliation_failed' | 'play_void_reconciliation_failed' | 'apple_history_reconciliation_failed' |
-    'play_notification_failed' | 'play_notification_unavailable' | 'play_notification_timeout', providerStatus?: number) => void;
+    'play_notification_failed' | 'play_notification_unavailable' | 'play_notification_timeout', providerStatus?: number,
+    scope?: { provider: 'apple' | 'play'; environment: 'live' | 'test' }) => void;
 }
 
 /** Replay notification history without advancing beyond an unverified or unqueued page. */
 export class AppleHistoryReconciler {
   constructor(readonly db:Database,readonly apple:Pick<AppleMinuteProvider,'environment'|'merchant'|'pollHistory'>) {}
   async page():Promise<{pages:number;scheduled:number;more:boolean}> {
+    try {
+      const result = await this.pollPage();
+      if (result.pages) await this.health(false);
+      return result;
+    } catch (error) {
+      await this.health(true, reconciliationProviderStatus(error));
+      throw error;
+    }
+  }
+  private async health(failed: boolean, providerStatus?: number) {
+    await this.db.query(`INSERT INTO provider_reconciliation_health(provider,environment,merchant,
+      first_failure_at,last_success_at,consecutive_failures,provider_status)
+      VALUES('apple',$1,$2,CASE WHEN $3 THEN now() END,CASE WHEN NOT $3 THEN now() END,
+        CASE WHEN $3 THEN 1 ELSE 0 END,$4)
+      ON CONFLICT(provider,environment,merchant) DO UPDATE SET last_attempt_at=now(),
+        first_failure_at=CASE WHEN $3 THEN COALESCE(provider_reconciliation_health.first_failure_at,now()) END,
+        last_success_at=CASE WHEN $3 THEN provider_reconciliation_health.last_success_at ELSE now() END,
+        consecutive_failures=CASE WHEN $3 THEN LEAST(provider_reconciliation_health.consecutive_failures,2147483646)+1 ELSE 0 END,
+        provider_status=$4`, [this.apple.environment,this.apple.merchant,failed,providerStatus??null]);
+  }
+  private async pollPage():Promise<{pages:number;scheduled:number;more:boolean}> {
     return transaction(this.db,async sql=>{
       const locked=(await sql.query('SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS acquired',
         [`mural-apple-history:${this.apple.environment}:${this.apple.merchant}`])).rows[0].acquired;
@@ -104,8 +131,9 @@ export class MinuteCommerceRunner {
       throw new ServiceError('minute_runner_configuration_invalid', 503);
     this.#onFailure = options.onFailure ?? (() => {});
   }
-  #failure(code: Parameters<NonNullable<CommerceRunnerOptions['onFailure']>>[0], providerStatus?: number) {
-    try { this.#onFailure(code, providerStatus); } catch { /* An observer cannot stop durable delivery. */ }
+  #failure(code: Parameters<NonNullable<CommerceRunnerOptions['onFailure']>>[0], providerStatus?: number,
+    scope?: Parameters<NonNullable<CommerceRunnerOptions['onFailure']>>[2]) {
+    try { this.#onFailure(code, providerStatus, scope); } catch { /* An observer cannot stop durable delivery. */ }
   }
   runOnce(): Promise<void> {
     if (this.#stopped) return Promise.resolve();
@@ -137,7 +165,8 @@ export class MinuteCommerceRunner {
     for(const history of [...(this.appleHistory?[this.appleHistory]:[]),...this.additionalAppleHistories]) {
       for(let index=0;index<this.#voidPages && !this.#stopped;index++){
         try {if(!(await history.page()).more)break;}
-        catch {this.#failure('apple_history_reconciliation_failed');break;}
+        catch (error) {this.#failure('apple_history_reconciliation_failed', reconciliationProviderStatus(error),
+          {provider:'apple',environment:history.apple.environment});break;}
       }
     }
   }

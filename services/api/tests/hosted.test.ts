@@ -104,6 +104,7 @@ async function fixture(cap = 2_000_000_000n, minuteAllowance?: number, helperBud
     set setupDelay(value: number) { setupDelay = value; }, get now() { return now; },
     advance(ms: number) { now += ms; },
     send(id: string, event: unknown) { sockets.get(id)!.send(JSON.stringify(event)); },
+    end(id: string, event: unknown) { const socket=sockets.get(id)!; socket.send(JSON.stringify(event), () => socket.close()); },
     disconnect(id: string) { sockets.get(id)!.terminate(); },
     async restart() { await controller.stop(); controller = new HostedVoice(db, provider,
       { accountAllowlist: new Set([account]), lifetimeFundingCapNano: cap,
@@ -127,6 +128,45 @@ integration('minute admission reserves helpers before any provider call and roll
     assert.deepEqual(await f.minutes(), { balance_ms: '600000', reserved_ms: '0' });
     for (const table of ['hosted_sessions', 'hosted_helper_sessions', 'minute_reservations'])
       assert.equal((await f.db.query(`SELECT count(*) AS total FROM ${table}`)).rows[0].total, '0');
+  } finally { await f.cleanup(); }
+});
+integration('rejected commands during close do not discard final usage and only one close command is sent', async () => {
+  const f = await fixture(2_000_000_000n, 600_000);
+  try {
+    const live = await f.controller.create(f.account, 'single-close-command', 'v=0', 'es-ES');
+    for (let i=0;i<4;i++) { await f.controller.close(f.account,live.sessionID); await f.controller.tick(); }
+    await until(() => f.closes===1);
+    for (const code of ['session_closing','immutable_field_update',null])
+      f.send(live.providerSessionID,{type:'error',error:{code,message:'private words and credentials'}});
+    f.end(live.providerSessionID,{type:'session.closed',usage:{seconds:42}});
+    await until(async () => (await f.controller.status(f.account,live.sessionID)).state==='closed');
+    assert.equal(f.closes,1);assert.equal(f.creates,1);
+    assert.deepEqual(await f.minutes(),{balance_ms:'558000',reserved_ms:'0'});
+    assert.equal((await f.db.query('SELECT usage_seconds FROM hosted_voice_final_usage')).rows[0].usage_seconds,42);
+    assert.equal(f.lifecycle.filter(r=>r.event==='voice_connection_lost').length,0);
+    assert.doesNotMatch(JSON.stringify(f.lifecycle),/private words|credentials/);
+  } finally { await f.cleanup(); }
+});
+
+integration('final usage survives a failed settlement and replays after restart without another provider attach', async () => {
+  const f = await fixture(2_000_000_000n,600_000);
+  try {
+    const live=await f.controller.create(f.account,'durable-final-usage','v=0','es-ES');
+    await f.db.query(`CREATE FUNCTION fail_settle() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+      IF NEW.kind='settle' THEN RAISE EXCEPTION 'injected settlement failure'; END IF; RETURN NEW; END $$;
+      CREATE TRIGGER fail_settle BEFORE INSERT ON minute_entries FOR EACH ROW EXECUTE FUNCTION fail_settle()`);
+    f.end(live.providerSessionID,{type:'session.closed',usage:{seconds:42}});
+    await until(async () => (await f.controller.status(f.account,live.sessionID)).state==='incomplete');
+    assert.deepEqual(await f.minutes(),{balance_ms:'600000',reserved_ms:'600000'});
+    assert.equal((await f.db.query('SELECT usage_seconds FROM hosted_voice_final_usage')).rows[0].usage_seconds,42);
+    await assert.rejects(f.db.query('UPDATE hosted_voice_final_usage SET usage_seconds=0'),/immutable/);
+    await f.db.query('DROP TRIGGER fail_settle ON minute_entries');
+    const attaches=f.attaches;await f.restart();
+    assert.equal((await f.controller.status(f.account,live.sessionID)).state,'closed');
+    assert.equal(f.attaches,attaches);assert.equal(f.creates,1);
+    await f.controller.tick();
+    assert.deepEqual(await f.minutes(),{balance_ms:'558000',reserved_ms:'0'});
+    assert.equal((await f.db.query("SELECT count(*) FROM minute_entries WHERE kind='settle'")).rows[0].count,'1');
   } finally { await f.cleanup(); }
 });
 integration('legacy isolated minute admission retains its allowance with an explicit test environment',async()=>{

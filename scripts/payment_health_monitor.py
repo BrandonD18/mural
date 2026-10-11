@@ -12,6 +12,54 @@ import ssl
 import subprocess
 import time
 from email.message import EmailMessage
+from datetime import date
+from collections import Counter
+
+
+RUNBOOK_URL = "https://github.com/Chuloo/mural/blob/main/release/operations/README.md"
+ALERT_GUIDANCE = {
+    "delivery_failed": (
+        "Payment delivery needs review",
+        "An order has a payment-delivery error after at least 15 minutes.",
+        "Check verified purchase status and worker errors, then retry the existing order."),
+    "delivery_worker_stalled": (
+        "Payment processing is delayed",
+        "A payment-processing job is at least 15 minutes overdue.",
+        "Check the processing worker, provider connection and database."),
+    "purchase_pending_48h": (
+        "Checkout has been pending for at least 48 hours",
+        "The payment provider still reports an unfinished checkout.",
+        "Check whether checkout completed or expired. Only credit a verified purchase."),
+    "play_acknowledgment_24h": (
+        "Google Play purchase processing is unfinished",
+        "A verified Google Play purchase has remained unfinished for at least 24 hours.",
+        "Review now and restore purchase delivery before the store acknowledgment deadline."),
+    "play_purchase_timestamp_missing": (
+        "Google Play purchase timing needs review",
+        "A purchased order has no verified purchase timestamp.",
+        "Check the purchase event record before calculating the store deadline."),
+    "settlement_overdue": (
+        "Conversations awaiting final usage confirmation",
+        "These conversations are still unresolved at least 15 minutes after their deadline. "
+        "Reserved minutes or funds remain on hold until final usage is verified.",
+        "Check the AI provider's final usage records and reconcile these conversations using the runbook."),
+    "provider_history_stalled": (
+        "Store reconciliation is delayed",
+        "An enabled store's history checkpoint is missing or has not advanced for an hour.",
+        "Check store credentials and provider responses, then replay verified history."),
+    "helper_usage_overdue": (
+        "Teaching requests awaiting final usage",
+        "An assessment or meaning request has unresolved provider usage at least 15 minutes after its deadline.",
+        "Inspect the existing request and provider evidence. Keep unresolved funding intact; do not repeat a billed request."),
+    "provider_reconciliation_failed": (
+        "Provider history requests are failing",
+        "History reconciliation has failed for at least 15 minutes, including scopes awaiting their first completion.",
+        "Check the provider and environment in the API diagnostics, credentials and provider status. Preserve the checkpoint."),
+    "inspection_failed": (
+        "The payment monitor could not complete its checks",
+        "The monitor could not read or validate the database snapshot. Current status is unknown.",
+        "Check database availability and the monitoring service."),
+}
 
 
 # A single read-only transaction gives every rule the same database snapshot.
@@ -32,9 +80,15 @@ SELECT json_build_object(
    WHERE j.state<>'done'
  ) t),'[]'),
  'sessions',coalesce((SELECT json_agg(t) FROM (
-   SELECT id,extract(epoch FROM now()-deadline)::bigint AS overdue_seconds
+   SELECT id,extract(epoch FROM now()-deadline)::bigint AS overdue_seconds,
+     to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD') AS created_day
    FROM hosted_sessions WHERE state<>'closed'
  ) t),'[]'),
+ 'helpers',coalesce((SELECT json_agg(t) FROM (
+   SELECT request_id AS id,extract(epoch FROM now()-active_until)::bigint AS overdue_seconds
+   FROM hosted_helper_requests WHERE state<>'settled'
+ ) t),'[]'),
+ 'reconciliation_health',RECONCILIATION_HEALTH,
  'cursors',coalesce((SELECT json_agg(t) FROM (
    SELECT 'apple' AS provider,environment,merchant,extract(epoch FROM now()-updated_at)::bigint AS age_seconds,
      floor(extract(epoch FROM now())-completed_through_ms/1000.0)::bigint AS completed_age_seconds
@@ -44,6 +98,13 @@ SELECT json_build_object(
  ) t),'[]'));
 COMMIT;
 """
+
+
+HEALTH_SQL = """coalesce((SELECT json_agg(t) FROM (
+ SELECT provider,environment,merchant,consecutive_failures,
+   extract(epoch FROM now()-first_failure_at)::bigint AS failure_age_seconds
+ FROM provider_reconciliation_health
+) t),'[]')"""
 
 
 def reference(value):
@@ -60,7 +121,13 @@ def inspect_snapshot(snapshot, expected_providers=(), expected_history_scopes=()
     activated = activated_history_scopes if activated_history_scopes is not None else set()
 
     def add(kind, row):
-        alerts.append({"kind": kind, "reference": reference(row["id"])})
+        alert = {"kind": kind, "reference": reference(row["id"])}
+        if kind == "settlement_overdue":
+            try:
+                alert["createdOn"] = date.fromisoformat(row["created_day"]).isoformat()
+            except (KeyError, TypeError, ValueError):
+                pass
+        alerts.append(alert)
 
     for row in snapshot["jobs"]:
         if row["reason"] == "provider_delivery_failed" and row["age_seconds"] >= 900:
@@ -80,6 +147,12 @@ def inspect_snapshot(snapshot, expected_providers=(), expected_history_scopes=()
     for row in snapshot["sessions"]:
         if row["overdue_seconds"] >= 900:
             add("settlement_overdue", row)
+    for row in snapshot.get("helpers", []):
+        if row["overdue_seconds"] >= 900:
+            add("helper_usage_overdue", row)
+    for row in snapshot.get("reconciliation_health", []):
+        if row["consecutive_failures"] > 0 and row["failure_age_seconds"] >= 900:
+            add("provider_reconciliation_failed", {"id": history_scope_key(row)})
     for provider in expected_providers:
         rows = [r for r in snapshot["cursors"] if r["provider"] == provider]
         if not rows or any(r["age_seconds"] >= 3600 for r in rows):
@@ -106,38 +179,93 @@ def collect(target, activated_history_scopes=None):
         "-v", "ON_ERROR_STOP=1", "-U", "mural", "-d", target["database"], "-f", "-"]
     # A command string (-c) may expose only the final COMMIT result on older psql.
     # A script preserves the SELECT output and still closes the read-only transaction.
-    result = subprocess.run(command, input=SNAPSHOT_SQL, capture_output=True, text=True, timeout=45, check=True)
+    result = subprocess.run(command, input=SNAPSHOT_SQL.replace("RECONCILIATION_HEALTH", HEALTH_SQL if target.get("reconciliationHealth", False) else "'[]'::json"), capture_output=True, text=True, timeout=45, check=True)
     return inspect_snapshot(json.loads(result.stdout), target.get("expectedProviders", []),
                             target.get("expectedHistoryScopes", []), activated_history_scopes)
+
+
+def alert_keys(alerts):
+    """Context changes must not turn an existing incident into a new email."""
+    return sorted((row["kind"], row["reference"]) for row in alerts)
 
 
 def notice_due(alerts, previous, now):
     """Notify changes after 15 minutes, unresolved incidents daily, and recovery once."""
     previous_alerts = previous.get("alerts", [])
     elapsed = now - previous.get("sentAt", 0)
-    changed = alerts != previous_alerts
+    changed = alert_keys(alerts) != alert_keys(previous_alerts)
     return bool((changed and elapsed >= 900) or (alerts and elapsed >= 86400))
 
 
-def make_message(sender, recipient, target, alerts, is_test=False):
+def conversation_dates(alerts):
+    dates = []
+    for row in alerts:
+        try:
+            dates.append(date.fromisoformat(row["createdOn"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+    if not dates:
+        return None
+    first, last = min(dates), max(dates)
+    if first == last:
+        return f"{first.day} {first:%B %Y}"
+    if (first.year, first.month) == (last.year, last.month):
+        return f"{first.day}–{last.day} {last:%B %Y}"
+    return f"{first.day} {first:%B %Y} – {last.day} {last:%B %Y}"
+
+
+def make_message(sender, recipient, target, alerts, is_test=False, is_reminder=False):
     message = EmailMessage()
     message["From"] = sender
     message["To"] = recipient
-    state = "delivery test" if is_test else "needs attention" if alerts else "recovered"
-    message["Subject"] = f"Mural payments: {target} {state}"
-    lines = [f"Mural payment operations — {target}", "", "Owner: William.",
-             "Customer replies: within one business day.", ""]
+    counts = Counter(row["kind"] for row in alerts)
+    prefix = "Mural reminder" if is_reminder else "Mural action needed"
+    if is_test:
+        subject = "Mural: alert delivery test"
+    elif counts and set(counts) == {"settlement_overdue"}:
+        noun = "conversation" if len(alerts) == 1 else "conversations"
+        subject = f"{prefix}: {len(alerts)} {noun} awaiting usage confirmation ({target})"
+    elif alerts:
+        noun = "check needs" if len(alerts) == 1 else "checks need"
+        subject = f"{prefix}: {len(alerts)} payment {noun} attention ({target})"
+    else:
+        subject = f"Mural: previously reported payment checks have cleared ({target})"
+    message["Subject"] = subject
+    lines = [f"Mural operations — {target}", ""]
     if is_test:
         lines.append("This checks alert delivery. No customer payment or balance was changed.")
     elif alerts:
+        if is_reminder:
+            lines += ["Daily reminder: the same checks are still unresolved. No new affected records since the previous email.", ""]
+        else:
+            lines += ["Action needed: review the checks below.", ""]
+        for kind, count in sorted(counts.items()):
+            title, meaning, action = ALERT_GUIDANCE.get(kind, (
+                "An operations check needs review",
+                "An unrecognized check was reported. Review it on the server.",
+                "Inspect the monitor and the operations runbook."))
+            lines += [f"{title}: {count}", meaning]
+            if kind == "settlement_overdue":
+                span = conversation_dates([row for row in alerts if row["kind"] == kind])
+                if span:
+                    lines.append(f"Conversations started: {span} (UTC dates).")
+            lines += [f"Next step: {action}", ""]
+        if set(counts) == {"settlement_overdue"}:
+            lines += ["This email reports conversation usage that needs reconciliation. "
+                      "No payment-delivery failures are reported in this check.", ""]
+        lines += ["Use verified provider records to resolve the alert. Do not guess final usage, "
+                  "release an unresolved balance hold, or add the same purchased credit twice.", "",
+                  f"Investigation instructions: {RUNBOOK_URL}", "",
+                  "Private support references (for server lookup):"]
         lines.extend(f"{row['kind']}: {row['reference']}" for row in alerts[:50])
         if len(alerts) > 50:
             lines.append(f"Additional affected checks: {len(alerts) - 50}.")
-        lines += ["", "Inspect provider evidence and the payment operations runbook.",
-                  "Do not recreate a grant, release a reservation or estimate final usage to clear an alert."]
     else:
-        lines.append("The previously reported checks now pass.")
-    lines += ["", "No customer names, email addresses, card data, receipt tokens or conversation content are included."]
+        lines.append("The previously reported checks now pass. No action is required for those alerts.")
+    lines += ["", "Owner: William.",
+              "If a customer contacts us, reply within one business day. Store deadlines still apply.",
+              "The monitor reports status only; it does not change payments or balances.", "",
+              "No customer names, email addresses, card data, receipt tokens or conversation content are included."]
     message.set_content("\n".join(lines))
     return message
 
@@ -178,6 +306,8 @@ def load_config(path):
             raise ValueError("invalid_compose_command")
         if not set(target.get("expectedProviders", [])).issubset({"apple", "play"}):
             raise ValueError("invalid_expected_provider")
+        if not isinstance(target.get("reconciliationHealth", False), bool):
+            raise ValueError("invalid_reconciliation_health_setting")
         scopes = target.get("expectedHistoryScopes", [])
         if not isinstance(scopes, list):
             raise ValueError("invalid_expected_history_scope")
@@ -212,7 +342,8 @@ def load_config(path):
 def deliver_target(config, name, alerts, previous, now, sender=send_smtp):
     if not notice_due(alerts, previous, now):
         return previous
-    sender(config["smtp"], make_message(config["sender"], config["recipient"], name, alerts))
+    is_reminder = bool(alerts and alert_keys(alerts) == alert_keys(previous.get("alerts", [])))
+    sender(config["smtp"], make_message(config["sender"], config["recipient"], name, alerts, is_reminder=is_reminder))
     # A failed send must never mark an incident delivered.
     return {**previous, "sentAt": now, "alerts": alerts}
 
