@@ -25,27 +25,29 @@ export interface CommerceRunnerOptions {
 export class AppleHistoryReconciler {
   constructor(readonly db:Database,readonly apple:Pick<AppleMinuteProvider,'environment'|'merchant'|'pollHistory'>) {}
   async page():Promise<{pages:number;scheduled:number;more:boolean}> {
+    let attemptedAt: string | undefined;
     try {
-      const result = await this.pollPage();
-      if (result.pages) await this.health(false);
+      const result = await this.pollPage(value => { attemptedAt = value; });
+      if (result.pages) await this.health(false, attemptedAt!);
       return result;
     } catch (error) {
-      await this.health(true, reconciliationProviderStatus(error));
+      if (attemptedAt) await this.health(true, attemptedAt, reconciliationProviderStatus(error));
       throw error;
     }
   }
-  private async health(failed: boolean, providerStatus?: number) {
+  private async health(failed: boolean, attemptedAt: string, providerStatus?: number) {
     await this.db.query(`INSERT INTO provider_reconciliation_health(provider,environment,merchant,
-      first_failure_at,last_success_at,consecutive_failures,provider_status)
-      VALUES('apple',$1,$2,CASE WHEN $3 THEN now() END,CASE WHEN NOT $3 THEN now() END,
+      last_attempt_at,first_failure_at,last_success_at,consecutive_failures,provider_status)
+      VALUES('apple',$1,$2,$5::timestamptz,CASE WHEN $3 THEN $5::timestamptz END,CASE WHEN NOT $3 THEN $5::timestamptz END,
         CASE WHEN $3 THEN 1 ELSE 0 END,$4)
-      ON CONFLICT(provider,environment,merchant) DO UPDATE SET last_attempt_at=now(),
-        first_failure_at=CASE WHEN $3 THEN COALESCE(provider_reconciliation_health.first_failure_at,now()) END,
-        last_success_at=CASE WHEN $3 THEN provider_reconciliation_health.last_success_at ELSE now() END,
+      ON CONFLICT(provider,environment,merchant) DO UPDATE SET last_attempt_at=EXCLUDED.last_attempt_at,
+        first_failure_at=CASE WHEN $3 THEN COALESCE(provider_reconciliation_health.first_failure_at,EXCLUDED.last_attempt_at) END,
+        last_success_at=CASE WHEN $3 THEN provider_reconciliation_health.last_success_at ELSE EXCLUDED.last_attempt_at END,
         consecutive_failures=CASE WHEN $3 THEN LEAST(provider_reconciliation_health.consecutive_failures,2147483646)+1 ELSE 0 END,
-        provider_status=$4`, [this.apple.environment,this.apple.merchant,failed,providerStatus??null]);
+        provider_status=$4 WHERE provider_reconciliation_health.last_attempt_at<EXCLUDED.last_attempt_at`,
+      [this.apple.environment,this.apple.merchant,failed,providerStatus??null,attemptedAt]);
   }
-  private async pollPage():Promise<{pages:number;scheduled:number;more:boolean}> {
+  private async pollPage(onAttempt: (value: string) => void):Promise<{pages:number;scheduled:number;more:boolean}> {
     return transaction(this.db,async sql=>{
       const locked=(await sql.query('SELECT pg_try_advisory_xact_lock(hashtextextended($1,0)) AS acquired',
         [`mural-apple-history:${this.apple.environment}:${this.apple.merchant}`])).rows[0].acquired;
@@ -53,6 +55,9 @@ export class AppleHistoryReconciler {
       await sql.query('INSERT INTO apple_notification_cursors(environment,merchant) VALUES($1,$2) ON CONFLICT DO NOTHING',[this.apple.environment,this.apple.merchant]);
       const row=(await sql.query('SELECT * FROM apple_notification_cursors WHERE environment=$1 AND merchant=$2',[this.apple.environment,this.apple.merchant])).rows[0];
       if(row.page_token===null && row.next_poll_after.getTime()>Date.now())return {pages:0,scheduled:0,more:false};
+      // Capture full database precision while holding the scope lock. A delayed
+      // health write must never replace the outcome of a later page attempt.
+      onAttempt((await sql.query('SELECT clock_timestamp()::text AS attempted_at')).rows[0].attempted_at);
       const now=Date.now(),retention=(this.apple.environment==='test'?30:180)*day;
       const end=row.window_end_ms===null?now-60_000:Number(row.window_end_ms);
       const start=row.window_start_ms===null?(row.completed_through_ms===null?now-retention+day:Number(row.completed_through_ms)-300_000):Number(row.window_start_ms);

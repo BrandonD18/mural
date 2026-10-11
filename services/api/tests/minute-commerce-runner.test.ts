@@ -11,6 +11,31 @@ const deferred = () => { let resolve!: () => void; const promise = new Promise<v
 const databaseURL = process.env.TEST_DATABASE_URL;
 if (databaseURL && !new URL(databaseURL).pathname.endsWith('_test')) throw new Error('Use an isolated test database.');
 const integration = (name: string, fn: () => Promise<void>) => test(name, { skip: !databaseURL && 'Set TEST_DATABASE_URL.' }, fn);
+for (const firstFails of [false,true]) integration(`a delayed Apple ${firstFails?'failure':'success'} cannot replace a newer page outcome`, async () => {
+  const f=await fixture(),entered=deferred(),release=deferred();let work:Promise<unknown>|undefined;
+  try {
+    const delayed=new Proxy(f.db,{get(target,key){
+      if(key==='query')return async (...args:any[])=>{
+        if(String(args[0]).startsWith('INSERT INTO provider_reconciliation_health')) {entered.resolve();await release.promise;}
+        return Reflect.apply(target.query,target,args);
+      };
+      const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value;
+    }});
+    const apple=(fails:boolean,more=false)=>({environment:'live' as const,merchant:'chat.mural.ios',pollHistory:async()=>{
+      if(fails)throw new APIException(401,null,'private response');
+      return {scheduled:0,nextPageToken:more?'next-page':undefined};
+    }});
+    work=new AppleHistoryReconciler(delayed,apple(firstFails,true)).page().then(value=>value,error=>error);
+    await entered.promise;
+    const newer=new AppleHistoryReconciler(f.db,apple(!firstFails));
+    if(firstFails)await newer.page();else await assert.rejects(newer.page(),{httpStatusCode:401});
+    const latest=(await f.db.query('SELECT * FROM provider_reconciliation_health')).rows[0];
+    assert.equal(latest.consecutive_failures,firstFails?0:1);
+    assert.equal(latest.provider_status,firstFails?null:401);
+    release.resolve();await work;
+    assert.deepEqual((await f.db.query('SELECT * FROM provider_reconciliation_health')).rows[0],latest);
+  } finally {release.resolve();await work;await f.cleanup();}
+});
 integration('Apple authorization failures survive rollback, identify the scope, and clear only after a successful history page', async () => {
   const f=await fixture();let fail=true;const observed:any[]=[];
   try {
