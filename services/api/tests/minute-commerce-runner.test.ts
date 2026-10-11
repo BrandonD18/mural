@@ -3,13 +3,64 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { connectDatabase } from '../src/db.js';
 import { migrate } from '../src/migrate.js';
-import { MinuteCommerceRunner, PlayVoidReconciler } from '../src/minute-commerce-runner.js';
+import { AppleHistoryReconciler, MinuteCommerceRunner, PlayVoidReconciler } from '../src/minute-commerce-runner.js';
+import { APIException } from '@apple/app-store-server-library';
 import { PlayNotificationTransportError } from '../src/google-play-rtdn.js';
 
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done; }); return { promise, resolve }; };
 const databaseURL = process.env.TEST_DATABASE_URL;
 if (databaseURL && !new URL(databaseURL).pathname.endsWith('_test')) throw new Error('Use an isolated test database.');
 const integration = (name: string, fn: () => Promise<void>) => test(name, { skip: !databaseURL && 'Set TEST_DATABASE_URL.' }, fn);
+for (const firstFails of [false,true]) integration(`a delayed Apple ${firstFails?'failure':'success'} cannot replace a newer page outcome`, async () => {
+  const f=await fixture(),entered=deferred(),release=deferred();let work:Promise<unknown>|undefined;
+  try {
+    const delayed=new Proxy(f.db,{get(target,key){
+      if(key==='query')return async (...args:any[])=>{
+        if(String(args[0]).startsWith('INSERT INTO provider_reconciliation_health')) {entered.resolve();await release.promise;}
+        return Reflect.apply(target.query,target,args);
+      };
+      const value=Reflect.get(target,key);return typeof value==='function'?value.bind(target):value;
+    }});
+    const apple=(fails:boolean,more=false)=>({environment:'live' as const,merchant:'chat.mural.ios',pollHistory:async()=>{
+      if(fails)throw new APIException(401,null,'private response');
+      return {scheduled:0,nextPageToken:more?'next-page':undefined};
+    }});
+    work=new AppleHistoryReconciler(delayed,apple(firstFails,true)).page().then(value=>value,error=>error);
+    await entered.promise;
+    const newer=new AppleHistoryReconciler(f.db,apple(!firstFails));
+    if(firstFails)await newer.page();else await assert.rejects(newer.page(),{httpStatusCode:401});
+    const latest=(await f.db.query('SELECT * FROM provider_reconciliation_health')).rows[0];
+    assert.equal(latest.consecutive_failures,firstFails?0:1);
+    assert.equal(latest.provider_status,firstFails?null:401);
+    release.resolve();await work;
+    assert.deepEqual((await f.db.query('SELECT * FROM provider_reconciliation_health')).rows[0],latest);
+  } finally {release.resolve();await work;await f.cleanup();}
+});
+integration('Apple authorization failures survive rollback, identify the scope, and clear only after a successful history page', async () => {
+  const f=await fixture();let fail=true;const observed:any[]=[];
+  try {
+    const apple={environment:'live' as const,merchant:'chat.mural.ios',pollHistory:async()=>{
+      if(fail)throw new APIException(401,null,'private provider response');
+      return {scheduled:0,nextPageToken:undefined};
+    }};
+    const history=new AppleHistoryReconciler(f.db,apple);
+    const runner=new MinuteCommerceRunner({scheduleReconciliation:async()=>0},
+      {runBatch:async()=>({processed:0,completed:0,retried:0})},undefined,
+      {onFailure:(code,status,scope)=>observed.push({code,status,scope})},history);
+    await runner.runOnce();await runner.runOnce();
+    assert.equal((await f.db.query('SELECT count(*) FROM apple_notification_cursors')).rows[0].count,'0');
+    const failed=(await f.db.query('SELECT * FROM provider_reconciliation_health')).rows[0];
+    assert.equal(failed.consecutive_failures,2);assert.equal(failed.provider_status,401);
+    assert.ok(failed.first_failure_at);assert.equal(failed.last_success_at,null);
+    assert.deepEqual(observed[0],{code:'apple_history_reconciliation_failed',status:401,scope:{provider:'apple',environment:'live'}});
+    assert.doesNotMatch(JSON.stringify(observed),/private/);
+    fail=false;await runner.runOnce();
+    const recovered=(await f.db.query('SELECT * FROM provider_reconciliation_health')).rows[0];
+    assert.equal(recovered.consecutive_failures,0);assert.equal(recovered.first_failure_at,null);
+    assert.equal(recovered.provider_status,null);assert.ok(recovered.last_success_at);
+    assert.ok((await f.db.query('SELECT completed_through_ms FROM apple_notification_cursors')).rows[0].completed_through_ms);
+  } finally {await f.cleanup();}
+});
 async function fixture() {
   const schema = `commerce_runner_${randomUUID().replaceAll('-', '')}`, url = new URL(databaseURL!);
   url.searchParams.set('options', `-c search_path=${schema}`);

@@ -85,7 +85,9 @@ export class HostedVoice {
       this.leaderError=() => { this.accepting = false; void this.emergencyClose(); };
       leader.on('error',this.leaderError);
       // Recovery prioritizes stopping billed sessions; it never opens a replacement session automatically.
-      const rows = (await this.db.query(`SELECT * FROM hosted_sessions WHERE ${unresolved}`)).rows;
+      const rows = (await this.db.query(`SELECT h.*,
+        (SELECT usage_seconds FROM hosted_voice_final_usage f WHERE f.session_id=h.id) AS final_usage_seconds
+        FROM hosted_sessions h WHERE ${unresolved}`)).rows;
       for (const row of rows) {
         if (!row.provider_session_id) {
           if (Number(row.minimum_charge_ms) === 15_000 && !row.provider_attempted_at) {
@@ -95,6 +97,7 @@ export class HostedVoice {
           await this.updateSessionState(row.id, "UPDATE hosted_sessions SET state='incomplete',close_reason='create_uncertain' WHERE id=$1 AND state<>'closed'", [row.id]);
           continue;
         }
+        if (row.final_usage_seconds !== null) { await this.replayFinalUsage(row); continue; }
         try { await this.attach(row.id, row.provider_session_id); } catch { /* The watchdog retries. */ }
         await this.requestClose(row.id, 'worker_recovery');
       }
@@ -320,13 +323,45 @@ export class HostedVoice {
       slot.connection = await this.provider.attach(providerID, event => {
         if (++slot.pending > 100) { void this.connectionLost(id); return; }
         slot.queue = slot.queue.then(() => this.recordUsage(id, providerID, event))
-          .catch(() => this.connectionLost(id)).finally(() => { slot.pending--; });
-      }, () => { void this.connectionLost(id); });
+          .catch(error => {
+            this.diagnostics.record('provider_failed', { operation: 'voice.settle', sessionReference: errorReference(id) }, error);
+            return this.connectionLost(id);
+          }).finally(() => { slot.pending--; });
+      }, () => {
+        // Drain already received usage before processing transport loss.
+        slot.queue = slot.queue.then(() => this.connectionLost(id));
+      });
       await slot.queue;
       if (!this.slots.has(id)) slot.connection.disconnect();
     } catch { this.slots.delete(id); throw new ServiceError('provider_attach_failed', 502); }
   }
+  private async replayFinalUsage(row: any) {
+    if ((this.recoveryAttempts.get(row.id)?.notBefore ?? 0) > this.now()) return;
+    try { await this.recordUsage(row.id, row.provider_session_id,
+      { type: 'session.closed', usage: { seconds: Number(row.final_usage_seconds) } }); }
+    catch (error) {
+      this.scheduleRecovery(row.id);
+      this.diagnostics.record('provider_failed', { operation: 'voice.settle.replay', sessionReference: errorReference(row.id) }, error);
+    }
+  }
+  private async preserveFinalUsage(id: string, providerID: string, event: VoiceUsage) {
+    await transaction(this.db, async sql => {
+      const row = (await sql.query('SELECT * FROM hosted_sessions WHERE id=$1', [id])).rows[0];
+      if (!row || row.provider_session_id !== providerID || row.rate_version !== RATE_VERSION)
+        throw new ServiceError('provider_session_mismatch');
+      if (row.state === 'closed') return;
+      const meter = new VoiceMeter(providerID, Number(row.limit_ms ?? row.reserved_ms ?? TRIAL_MS));
+      meter.milliseconds = Number(row.observed_ms); meter.receive(providerID, event);
+      if (!meter.finalized) throw new ServiceError('invalid_provider_usage');
+      await sql.query(`INSERT INTO hosted_voice_final_usage(session_id,provider_session_id,usage_seconds)
+        VALUES($1,$2,$3) ON CONFLICT(session_id) DO NOTHING`, [id,providerID,event.usage.seconds]);
+      const saved = (await sql.query('SELECT provider_session_id,usage_seconds FROM hosted_voice_final_usage WHERE session_id=$1', [id])).rows[0];
+      if (saved.provider_session_id !== providerID || Number(saved.usage_seconds) !== event.usage.seconds)
+        throw new ServiceError('provider_final_usage_conflict');
+    });
+  }
   private async recordUsage(id: string, providerID: string, event: VoiceUsage) {
+    if (event.type === 'session.closed') await this.preserveFinalUsage(id, providerID, event);
     const state = await transaction(this.db, async sql => {
       // Match admission/helper lock order so final voice cost and reduced helper liability
       // become visible atomically to a new funded conversation.
@@ -478,6 +513,7 @@ export class HostedVoice {
     try {
       await this.leader.query('SELECT 1');
       const rows = (await this.db.query(`SELECT h.*,w.balance_nano,w.reserved_nano,w.sandbox_balance_nano,
+        (SELECT usage_seconds FROM hosted_voice_final_usage f WHERE f.session_id=h.id) AS final_usage_seconds,
         (SELECT environment FROM deployment_environment WHERE singleton) AS deployment_environment,
         (SELECT COALESCE(sum(r.reserved_nano),0) FROM reservations r WHERE r.account_id=h.account_id
           AND r.state='open' AND r.funding_environment=h.funding_environment)+
@@ -487,6 +523,7 @@ export class HostedVoice {
           AND (NOT h.public_minutes OR p.environment='live') AND p.recovered_ms<LEAST(p.reversal_target_ms,p.granted_ms)) AS minute_refund_due
         FROM hosted_sessions h LEFT JOIN wallets w ON w.account_id=h.account_id WHERE h.state<>'closed'`)).rows;
       for (const row of rows) {
+        if (row.final_usage_seconds !== null) { await this.replayFinalUsage(row); continue; }
         if (!row.provider_session_id) {
           if (Number(row.minimum_charge_ms) === 15_000 && !row.provider_attempted_at &&
             (row.close_requested_at || this.now() >= new Date(row.deadline).getTime()))

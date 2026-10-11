@@ -434,7 +434,7 @@ integration('actual runtime grants support dual Apple purchases, scoped settleme
   let runtime:ReturnType<typeof connectDatabase>|undefined;
   try {
     await f.db.query(`CREATE ROLE ${role};GRANT USAGE ON SCHEMA ${f.schema} TO ${role};GRANT SELECT,UPDATE ON accounts TO ${role}`);
-    for(const file of ['minute-runtime-grants.sql','minute-purchase-runtime-grants.sql','minute-provider-runtime-grants.sql','actual-value-runtime-grants.sql','apple-purchase-runtime-grants.sql']) {
+    for(const file of ['minute-runtime-grants.sql','minute-purchase-runtime-grants.sql','minute-provider-runtime-grants.sql','actual-value-runtime-grants.sql','apple-purchase-runtime-grants.sql','closeout-evidence-runtime-grants.sql']) {
       const grants=await readFile(new URL(`../operations/${file}`,import.meta.url),'utf8');await f.db.query(grants.replaceAll('mural_runtime',role));
     }
     const url=new URL(f.url);url.searchParams.set('options',`-c search_path=${f.schema} -c role=${role}`);runtime=connectDatabase(url.toString());

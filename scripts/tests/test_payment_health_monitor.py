@@ -60,6 +60,42 @@ class PaymentHealthMonitorTests(unittest.TestCase):
     def test_normal_unpaid_checkout_does_not_alert(self):
         self.assertEqual(monitor.inspect_snapshot(self.snapshot()), [])
 
+    def test_helpers_alert_only_after_deadline_and_never_expose_request_content(self):
+        snapshot = self.snapshot()
+        snapshot["helpers"] = [{"id": "private-request", "overdue_seconds": 899, "content": "secret"}]
+        self.assertEqual(monitor.inspect_snapshot(snapshot), [])
+        snapshot["helpers"][0]["overdue_seconds"] = 900
+        alerts = monitor.inspect_snapshot(snapshot)
+        self.assertEqual(alerts, [{"kind": "helper_usage_overdue", "reference": monitor.reference("private-request")}])
+        body = monitor.make_message("a@example.com", "b@example.com", "production", alerts).get_content()
+        self.assertIn("Teaching requests awaiting final usage", body)
+        self.assertNotIn("private-request", body)
+        self.assertNotIn("secret", body)
+
+    def test_failed_history_alerts_before_first_success_without_activating_scope(self):
+        snapshot = self.snapshot()
+        snapshot["reconciliation_health"] = [{"provider": "apple", "environment": "live",
+            "merchant": "chat.mural.ios", "consecutive_failures": 2, "failure_age_seconds": 900}]
+        activated = set()
+        alerts = monitor.inspect_snapshot(snapshot, expected_history_scopes=[self.scope()], activated_history_scopes=activated)
+        self.assertEqual([a["kind"] for a in alerts], ["provider_reconciliation_failed"])
+        self.assertEqual(activated, set())
+        snapshot["reconciliation_health"][0]["failure_age_seconds"] = 899
+        self.assertEqual(monitor.inspect_snapshot(snapshot), [])
+        snapshot["reconciliation_health"][0].update(consecutive_failures=0, failure_age_seconds=None)
+        self.assertEqual(monitor.inspect_snapshot(snapshot), [])
+
+    def test_health_query_requires_explicit_migrated_target(self):
+        target = {"compose": ["compose"], "database": "mural"}
+        with patch.object(monitor.subprocess, "run", return_value=MagicMock(stdout=json.dumps(self.snapshot()))) as run:
+            monitor.collect(target)
+            self.assertNotIn("FROM provider_reconciliation_health", run.call_args.kwargs["input"])
+            monitor.collect({**target, "reconciliationHealth": True})
+            sql = run.call_args.kwargs["input"]
+            self.assertIn("FROM provider_reconciliation_health", sql)
+            self.assertIn("REPEATABLE READ READ ONLY", sql)
+            self.assertNotIn("RECONCILIATION_HEALTH", sql)
+
     def test_pending_48h_alerts_without_exposing_order(self):
         result = monitor.inspect_snapshot(self.snapshot(age_seconds=172800))
         self.assertEqual(result[0]["kind"], "purchase_pending_48h")
@@ -229,6 +265,90 @@ class PaymentHealthMonitorTests(unittest.TestCase):
         self.assertFalse(monitor.notice_due([], previous, 100899))
         self.assertTrue(monitor.notice_due([], previous, 100900))
         self.assertFalse(monitor.notice_due([], {"sentAt": 100000, "alerts": []}, 200000))
+
+    def test_date_context_upgrade_does_not_send_an_extra_alert(self):
+        old = [{"kind": "settlement_overdue", "reference": "abc"}]
+        current = [{**old[0], "createdOn": "2026-09-14"}]
+        previous = {"sentAt": 100000, "alerts": old}
+        self.assertFalse(monitor.notice_due(current, previous, 101000))
+        self.assertTrue(monitor.notice_due(current, previous, 186400))
+        current[0]["reference"] = "different-conversation"
+        self.assertTrue(monitor.notice_due(current, previous, 101000))
+
+    def test_context_includes_only_valid_conversation_dates(self):
+        snapshot = self.snapshot()
+        snapshot["sessions"] = [{"id": "private-session", "overdue_seconds": 900,
+                                 "created_day": "2026-09-14", "email": "private@example.com",
+                                 "conversation": "private words", "receipt": "private-token"}]
+        alerts = monitor.inspect_snapshot(snapshot)
+        self.assertEqual(alerts, [{"kind": "settlement_overdue",
+                                  "reference": monitor.reference("private-session"),
+                                  "createdOn": "2026-09-14"}])
+        message = monitor.make_message("a@example.com", "b@example.com", "production", alerts)
+        for private in ("private-session", "private@example.com", "private words", "private-token"):
+            self.assertNotIn(private, message.as_string())
+        snapshot["sessions"][0]["created_day"] = "private@example.com"
+        self.assertNotIn("createdOn", monitor.inspect_snapshot(snapshot)[0])
+
+    def test_settlement_message_explains_usage_and_dates_before_references(self):
+        alerts = [{"kind": "settlement_overdue", "reference": "abc", "createdOn": "2026-09-14"},
+                  {"kind": "settlement_overdue", "reference": "def", "createdOn": "2026-09-16"}]
+        message = monitor.make_message("a@example.com", "b@example.com", "production", alerts)
+        self.assertIn("2 conversations awaiting usage confirmation", message["Subject"])
+        body = message.get_content()
+        self.assertIn("14–16 September 2026", body)
+        self.assertIn("remain on hold until final usage is verified", body)
+        self.assertIn(monitor.RUNBOOK_URL, body)
+        self.assertLess(body.index("Next step:"), body.index("settlement_overdue: abc"))
+        self.assertNotIn("Daily reminder:", body)
+
+    def test_daily_delivery_uses_same_incident_label_with_legacy_state(self):
+        sender = MagicMock()
+        old = [{"kind": "settlement_overdue", "reference": "abc"}]
+        current = [{**old[0], "createdOn": "2026-09-14"}]
+        previous = {"sentAt": 100000, "alerts": old}
+        config = {"smtp": {}, "sender": "a@example.com", "recipient": "b@example.com"}
+        monitor.deliver_target(config, "production", current, previous, 101000, sender)
+        sender.assert_not_called()
+        monitor.deliver_target(config, "production", current, previous, 186400, sender)
+        message = sender.call_args.args[1]
+        self.assertIn("Mural reminder:", message["Subject"])
+        self.assertIn("1 conversation awaiting", message["Subject"])
+        self.assertIn("No new affected records", message.get_content())
+
+    def test_mixed_alerts_do_not_claim_no_payment_delivery_failures(self):
+        alerts = [{"kind": "settlement_overdue", "reference": "abc"},
+                  {"kind": "delivery_failed", "reference": "def"}]
+        message = monitor.make_message("a@example.com", "b@example.com", "production", alerts)
+        self.assertIn("2 payment checks", message["Subject"])
+        body = message.get_content()
+        self.assertIn("Payment delivery needs review", body)
+        self.assertNotIn("No payment-delivery failures", body)
+        self.assertNotIn("Conversations started:", body)
+
+    def test_date_range_is_omitted_when_any_date_is_unknown(self):
+        self.assertIsNone(monitor.conversation_dates([{"createdOn": "2026-09-14"}, {}]))
+        self.assertIsNone(monitor.conversation_dates([{"createdOn": "2026-02-31"}]))
+        self.assertEqual(monitor.conversation_dates([{"createdOn": "2026-09-14"}]), "14 September 2026")
+        self.assertEqual(monitor.conversation_dates([{"createdOn": "2026-09-30"},
+                                                     {"createdOn": "2026-10-01"}]),
+                         "30 September 2026 – 1 October 2026")
+
+    def test_summary_counts_all_alerts_while_support_references_are_bounded(self):
+        alerts = [{"kind": "settlement_overdue", "reference": f"ref-{i:03}"} for i in range(53)]
+        message = monitor.make_message("a@example.com", "b@example.com", "production", alerts)
+        self.assertIn("53 conversations", message["Subject"])
+        body = message.get_content()
+        self.assertEqual(body.count("settlement_overdue: ref-"), 50)
+        self.assertIn("Additional affected checks: 3.", body)
+
+    def test_recovery_and_delivery_test_do_not_claim_an_active_incident(self):
+        recovered = monitor.make_message("a@example.com", "b@example.com", "production", [])
+        self.assertIn("previously reported", recovered["Subject"])
+        self.assertNotIn("Action needed:", recovered.get_content())
+        test = monitor.make_message("a@example.com", "b@example.com", "delivery", [], is_test=True)
+        self.assertEqual(test["Subject"], "Mural: alert delivery test")
+        self.assertIn("No customer payment or balance was changed", test.get_content())
 
     def test_mail_failure_preserves_last_successful_state(self):
         previous = {"sentAt": 100000, "alerts": []}

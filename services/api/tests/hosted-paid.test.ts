@@ -330,7 +330,7 @@ for (const legacyColumnGrants of [false,true]) integration(`the restricted runti
     GRANT UPDATE(account_id,funding_mode,limit_ms,helper_closed_at,funding_environment) ON hosted_sessions TO ${role}`);
   assert.equal((await db!.query("SELECT has_table_privilege($1,'hosted_sessions','UPDATE') AS allowed",[role])).rows[0].allowed,true);
   if(legacyColumnGrants) assert.equal((await db!.query("SELECT has_table_privilege($1,'reservations','UPDATE') AS allowed",[role])).rows[0].allowed,true);
-  for(const file of ['minute-runtime-grants.sql','hosted-helper-runtime-grants.sql','actual-value-runtime-grants.sql','hosted-close-runtime-grants.sql']) {
+  for(const file of ['minute-runtime-grants.sql','hosted-helper-runtime-grants.sql','actual-value-runtime-grants.sql','hosted-close-runtime-grants.sql','closeout-evidence-runtime-grants.sql']) {
     const grants=await readFile(new URL(`../operations/${file}`,import.meta.url),'utf8');await db!.query(grants.replaceAll('mural_runtime',role));
   }
   const privileges=(await db!.query(`SELECT c.relname,a.attname,has_column_privilege($1,c.oid,a.attnum,'UPDATE') AS allowed
