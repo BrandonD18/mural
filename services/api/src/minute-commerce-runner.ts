@@ -59,18 +59,23 @@ export class AppleHistoryReconciler {
       // health write must never replace the outcome of a later page attempt.
       onAttempt((await sql.query('SELECT clock_timestamp()::text AS attempted_at')).rows[0].attempted_at);
       const now=Date.now(),retention=(this.apple.environment==='test'?30:180)*day;
-      const end=row.window_end_ms===null?now-60_000:Number(row.window_end_ms);
+      const target=now-60_000;
       const start=row.window_start_ms===null?(row.completed_through_ms===null?now-retention+day:Number(row.completed_through_ms)-300_000):Number(row.window_start_ms);
+      // Apple can time out on the initial retention-wide request. Cover the same
+      // history in bounded, overlapping windows; resume issued page tokens with
+      // their original dates, and never skip ahead to open checkout prematurely.
+      const end=row.window_end_ms===null?Math.min(target,start+7*day):Number(row.window_end_ms);
       if(start<now-retention+60_000)throw new ServiceError('apple_history_cursor_expired',503);
       if(start>=end || (row.page_token===null && row.completed_through_ms!==null && end<=Number(row.completed_through_ms)))
         return {pages:0,scheduled:0,more:false};
       const result=await this.apple.pollHistory(start,end,row.page_token??undefined);
       if(result.nextPageToken && result.nextPageToken===row.page_token)throw new ServiceError('apple_history_cursor_stalled',502);
+      const more=!!result.nextPageToken || end<target;
       await sql.query(`UPDATE apple_notification_cursors SET completed_through_ms=CASE WHEN $5::text IS NULL THEN $4::bigint ELSE completed_through_ms END,
         window_start_ms=CASE WHEN $5::text IS NULL THEN NULL ELSE $3::bigint END,window_end_ms=CASE WHEN $5::text IS NULL THEN NULL ELSE $4::bigint END,
-        page_token=$5,next_poll_after=CASE WHEN $5::text IS NULL THEN now()+interval '15 minutes' ELSE now() END,updated_at=now()
-        WHERE environment=$1 AND merchant=$2`,[this.apple.environment,this.apple.merchant,start,end,result.nextPageToken??null]);
-      return {pages:1,scheduled:result.scheduled,more:!!result.nextPageToken};
+        page_token=$5,next_poll_after=CASE WHEN $6::boolean THEN now() ELSE now()+interval '15 minutes' END,updated_at=now()
+        WHERE environment=$1 AND merchant=$2`,[this.apple.environment,this.apple.merchant,start,end,result.nextPageToken??null,more]);
+      return {pages:1,scheduled:result.scheduled,more};
     });
   }
 }

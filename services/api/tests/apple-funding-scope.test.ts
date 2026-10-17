@@ -114,7 +114,7 @@ integration('dual Apple checkout opens separately after real completed history a
     for(const scope of ['live','test'] as const){assert.equal((await catalog(scope)).json().available,false);assert.equal((await checkout(scope)).statusCode,503);}
     await f.db.query("INSERT INTO apple_notification_cursors(environment,merchant,completed_through_ms) VALUES('live','foreign.app',floor(extract(epoch FROM now())*1000)::bigint)");
     assert.equal(await f.scopes.admissionReady('live'),false);
-    await new AppleHistoryReconciler(f.db,f.sandbox).page();
+    while ((await new AppleHistoryReconciler(f.db,f.sandbox).page()).more) {}
     assert.deepEqual(await f.scopes.historyReadiness(),{liveReady:false,testReady:true});
     assert.equal((await catalog('test')).json().available,true);await f.order('test');
     const original=f.liveTransport.history;
@@ -122,7 +122,11 @@ integration('dual Apple checkout opens separately after real completed history a
     await assert.rejects(new AppleHistoryReconciler(f.db,f.live).page());
     assert.equal((await f.db.query("SELECT count(*) FROM apple_notification_cursors WHERE environment='live' AND merchant='chat.mural.ios'")).rows[0].count,'0');
     assert.equal((await checkout('live')).statusCode,503);
-    f.liveTransport.history=original;await new AppleHistoryReconciler(f.db,f.live).page();
+    f.liveTransport.history=original;
+    assert.equal((await new AppleHistoryReconciler(f.db,f.live).page()).more,true);
+    assert.equal(await f.scopes.admissionReady('live'),false);
+    assert.equal((await checkout('live')).statusCode,503);
+    while ((await new AppleHistoryReconciler(f.db,f.live).page()).more) {}
     assert.deepEqual(await f.scopes.historyReadiness(),{liveReady:true,testReady:true});
     assert.equal((await catalog('live')).json().available,true);await f.order('live');
     await f.db.query("UPDATE apple_notification_cursors SET completed_through_ms=floor(extract(epoch FROM now()-interval '2 hours')*1000)::bigint,updated_at=now(),page_token='page-in-progress',window_start_ms=1,window_end_ms=2 WHERE merchant='chat.mural.ios' AND environment='live'");
@@ -137,7 +141,7 @@ integration('dual Apple checkout opens separately after real completed history a
 
 integration('closed Apple checkout retains authenticated balance, delivery, recovery and refunds',async()=>{
   const f=await fixture(true);try{
-    await new AppleHistoryReconciler(f.db,f.sandbox).page();
+    while ((await new AppleHistoryReconciler(f.db,f.sandbox).page()).more) {}
     const {order,value}=await f.order('test');
     await f.db.query("UPDATE apple_notification_cursors SET completed_through_ms=floor(extract(epoch FROM now()-interval '2 hours')*1000)::bigint,updated_at=now()");
     assert.equal(await f.scopes.admissionReady('test'),false);
@@ -442,7 +446,7 @@ integration('actual runtime grants support dual Apple purchases, scoped settleme
     const live=new AppleMinuteProvider(runtime,vault,f.live.config,f.liveTransport),sandbox=new AppleMinuteProvider(runtime,vault,f.sandbox.config,f.testTransport);
     const scopes=new ApplePurchaseScopes(live,sandbox,true);
     assert.deepEqual(await scopes.historyReadiness(),{liveReady:false,testReady:false});
-    await new AppleHistoryReconciler(runtime,sandbox).page();
+    while ((await new AppleHistoryReconciler(runtime,sandbox).page()).more) {}
     assert.deepEqual(await scopes.historyReadiness(),{liveReady:false,testReady:true});
     const ai=new AIValuePurchases(runtime,{catalog:f.ai.products('apple'),verifiers:[live,sandbox],salesEnabled:true,quantityEnabled:['apple']});
     const legacy=new MinutePurchases(runtime,{verifiers:[live]}),fulfillment=new PurchaseFulfillmentRouter(runtime,legacy,ai,[live,sandbox]);
