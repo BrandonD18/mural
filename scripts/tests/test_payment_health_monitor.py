@@ -72,6 +72,40 @@ class PaymentHealthMonitorTests(unittest.TestCase):
         self.assertNotIn("private-request", body)
         self.assertNotIn("secret", body)
 
+    def test_approved_helper_exception_is_exact_and_does_not_hide_other_alerts(self):
+        snapshot = self.snapshot()
+        helper = {"id": "reviewed-request", "overdue_seconds": 10000, "state": "uncertain",
+                  "customer_cash_reserved": False, "review_fingerprint": "a" * 64}
+        snapshot["helpers"] = [helper, {**helper, "id": "new-request"}]
+        reviewed = [{"reference": monitor.reference(helper["id"]), "fingerprint": "a" * 64}]
+        alerts = monitor.inspect_snapshot(snapshot, reviewed_helper_usage=reviewed)
+        self.assertEqual(alerts, [{"kind": "helper_usage_overdue", "reference": monitor.reference("new-request")}])
+        for field, value in [("state", "pending"), ("customer_cash_reserved", True),
+                             ("review_fingerprint", "b" * 64), ("review_fingerprint", None)]:
+            changed = copy.deepcopy(snapshot); changed["helpers"][0][field] = value
+            self.assertEqual(len(monitor.inspect_snapshot(changed, reviewed_helper_usage=reviewed)), 2)
+        self.assertEqual(len(monitor.inspect_snapshot(snapshot)), 2)
+        snapshot["sessions"] = [{"id": "voice", "overdue_seconds": 10000}]
+        self.assertIn("settlement_overdue", [a["kind"] for a in monitor.inspect_snapshot(snapshot, reviewed_helper_usage=reviewed)])
+
+    def test_helper_review_requires_private_config_and_auditable_approval(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = self.monitor_config(directory)
+            config = json.loads(path.read_text())
+            review = {"reference": "a" * 12, "fingerprint": "b" * 64, "caseID": "reviewed-usage",
+                      "approvedBy": "William", "approvedOn": "2026-10-18"}
+            config["targets"][0]["reviewedHelperUsage"] = [review]
+            path.write_text(json.dumps(config))
+            self.assertEqual(monitor.load_config(path)["targets"][0]["reviewedHelperUsage"], [review])
+            for key in review:
+                invalid = copy.deepcopy(config); del invalid["targets"][0]["reviewedHelperUsage"][0][key]
+                path.write_text(json.dumps(invalid))
+                with self.assertRaises((ValueError, TypeError)):
+                    monitor.load_config(path)
+            config["targets"][0]["reviewedHelperUsage"] = [review, review]
+            path.write_text(json.dumps(config))
+            with self.assertRaises(ValueError): monitor.load_config(path)
+
     def test_failed_history_alerts_before_first_success_without_activating_scope(self):
         snapshot = self.snapshot()
         snapshot["reconciliation_health"] = [{"provider": "apple", "environment": "live",
