@@ -70,7 +70,10 @@ export class AppleHistoryReconciler {
         return {pages:0,scheduled:0,more:false};
       const result=await this.apple.pollHistory(start,end,row.page_token??undefined);
       if(result.nextPageToken && result.nextPageToken===row.page_token)throw new ServiceError('apple_history_cursor_stalled',502);
-      const more=!!result.nextPageToken || end<target;
+      // A paginated window keeps its original end while the clock advances.
+      // Treat completion within the overlap horizon as caught up; otherwise
+      // even milliseconds spent fetching page two can create an endless replay.
+      const more=!!result.nextPageToken || end<target-300_000;
       await sql.query(`UPDATE apple_notification_cursors SET completed_through_ms=CASE WHEN $5::text IS NULL THEN $4::bigint ELSE completed_through_ms END,
         window_start_ms=CASE WHEN $5::text IS NULL THEN NULL ELSE $3::bigint END,window_end_ms=CASE WHEN $5::text IS NULL THEN NULL ELSE $4::bigint END,
         page_token=$5,next_poll_after=CASE WHEN $6::boolean THEN now() ELSE now()+interval '15 minutes' END,updated_at=now()
