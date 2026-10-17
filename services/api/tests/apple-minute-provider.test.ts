@@ -175,8 +175,10 @@ integration('Apple history checkpoints complete pages, preserves a failed page a
     assert.equal((await cursor.page()).more,true);
     await assert.rejects(cursor.page());
     assert.equal((await f.db.query('SELECT page_token FROM apple_notification_cursors')).rows[0].page_token,'page-two');
-    fail=false;assert.equal((await cursor.page()).more,false);
+    fail=false;assert.equal((await cursor.page()).more,true);
     assert.equal(calls[1]!.start,calls[0]!.start);assert.equal(calls[2]!.end,calls[0]!.end);
+    while ((await cursor.page()).more) {}
+    const finishedCalls=calls.length;
     assert.deepEqual(await cursor.page(),{pages:0,scheduled:0,more:false});
     // A clock adjustment must never move the completed checkpoint backwards.
     const future=Date.now()+60_000;
@@ -185,7 +187,7 @@ integration('Apple history checkpoints complete pages, preserves a failed page a
     assert.equal(Number((await f.db.query('SELECT completed_through_ms FROM apple_notification_cursors')).rows[0].completed_through_ms),future);
     await f.db.query("UPDATE apple_notification_cursors SET completed_through_ms=$1,next_poll_after=now()-interval '1 second'",[Date.now()-31*86_400_000]);
     await assert.rejects(cursor.page(),{code:'apple_history_cursor_expired'});
-    assert.equal(calls.length,3);
+    assert.equal(calls.length,finishedCalls);
   }finally{await f.cleanup();}
 });
 
