@@ -85,8 +85,10 @@ SELECT json_build_object(
    FROM hosted_sessions WHERE state<>'closed'
  ) t),'[]'),
  'helpers',coalesce((SELECT json_agg(t) FROM (
-   SELECT request_id AS id,extract(epoch FROM now()-active_until)::bigint AS overdue_seconds
-   FROM hosted_helper_requests WHERE state<>'settled'
+   SELECT request_id AS id,extract(epoch FROM now()-active_until)::bigint AS overdue_seconds,
+     state,cash_reservation_id IS NOT NULL AS customer_cash_reserved,
+     encode(sha256(convert_to(to_jsonb(h)::text,'UTF8')),'hex') AS review_fingerprint
+   FROM hosted_helper_requests h WHERE state<>'settled'
  ) t),'[]'),
  'reconciliation_health',RECONCILIATION_HEALTH,
  'cursors',coalesce((SELECT json_agg(t) FROM (
@@ -116,8 +118,9 @@ def history_scope_key(scope):
     return ":".join(scope[key] for key in ("provider", "environment", "merchant"))
 
 
-def inspect_snapshot(snapshot, expected_providers=(), expected_history_scopes=(), activated_history_scopes=None):
+def inspect_snapshot(snapshot, expected_providers=(), expected_history_scopes=(), activated_history_scopes=None, reviewed_helper_usage=()):
     alerts = []
+    reviewed = {row["reference"]: row["fingerprint"] for row in reviewed_helper_usage}
     activated = activated_history_scopes if activated_history_scopes is not None else set()
 
     def add(kind, row):
@@ -149,7 +152,11 @@ def inspect_snapshot(snapshot, expected_providers=(), expected_history_scopes=()
             add("settlement_overdue", row)
     for row in snapshot.get("helpers", []):
         if row["overdue_seconds"] >= 900:
-            add("helper_usage_overdue", row)
+            acknowledged = (row.get("state") == "uncertain" and row.get("customer_cash_reserved") is False
+                and isinstance(row.get("review_fingerprint"), str)
+                and reviewed.get(reference(row["id"])) == row["review_fingerprint"])
+            if not acknowledged:
+                add("helper_usage_overdue", row)
     for row in snapshot.get("reconciliation_health", []):
         if row["consecutive_failures"] > 0 and row["failure_age_seconds"] >= 900:
             add("provider_reconciliation_failed", {"id": history_scope_key(row)})
@@ -181,7 +188,7 @@ def collect(target, activated_history_scopes=None):
     # A script preserves the SELECT output and still closes the read-only transaction.
     result = subprocess.run(command, input=SNAPSHOT_SQL.replace("RECONCILIATION_HEALTH", HEALTH_SQL if target.get("reconciliationHealth", False) else "'[]'::json"), capture_output=True, text=True, timeout=45, check=True)
     return inspect_snapshot(json.loads(result.stdout), target.get("expectedProviders", []),
-                            target.get("expectedHistoryScopes", []), activated_history_scopes)
+                            target.get("expectedHistoryScopes", []), activated_history_scopes, target.get("reviewedHelperUsage", []))
 
 
 def alert_keys(alerts):
@@ -308,6 +315,20 @@ def load_config(path):
             raise ValueError("invalid_expected_provider")
         if not isinstance(target.get("reconciliationHealth", False), bool):
             raise ValueError("invalid_reconciliation_health_setting")
+        reviewed = target.get("reviewedHelperUsage", [])
+        if not isinstance(reviewed, list) or len(reviewed) > 1000:
+            raise ValueError("invalid_reviewed_helper_usage")
+        seen_reviews = set()
+        for row in reviewed:
+            if (not isinstance(row, dict) or set(row) != {"reference", "fingerprint", "caseID", "approvedBy", "approvedOn"}
+                    or not re.fullmatch(r"[a-f0-9]{12}", str(row.get("reference", "")))
+                    or not re.fullmatch(r"[a-f0-9]{64}", str(row.get("fingerprint", "")))
+                    or not re.fullmatch(r"[a-z0-9-]{3,100}", str(row.get("caseID", "")))
+                    or not isinstance(row.get("approvedBy"), str) or not row["approvedBy"].strip()
+                    or len(row["approvedBy"]) > 100 or row["reference"] in seen_reviews):
+                raise ValueError("invalid_reviewed_helper_usage")
+            date.fromisoformat(row["approvedOn"])
+            seen_reviews.add(row["reference"])
         scopes = target.get("expectedHistoryScopes", [])
         if not isinstance(scopes, list):
             raise ValueError("invalid_expected_history_scope")

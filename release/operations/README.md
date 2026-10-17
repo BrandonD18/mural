@@ -50,6 +50,12 @@ For an overdue session, inspect its saved final-usage evidence, settlement diagn
 
 Helper usage alerts cover unresolved assessment and meaning requests, including requests without a customer cash reservation. A timeout alone does not establish their final provider cost. Preserve the request and any hold while investigating its response identifier and available provider evidence.
 
+## Approved teaching-usage exceptions
+
+An operator may record a reviewed, Mural-funded teaching request under a target's `reviewedHelperUsage` configuration after explicit owner approval. Each entry includes its support reference, SHA-256 fingerprint of the complete stored request row, audit case ID, approver and approval date. Keep the approval and before/after evidence in a protected server audit directory.
+
+The monitor acknowledges only an unchanged `uncertain` request with no customer cash reservation. New requests, changed evidence, pending requests and customer-funded holds continue to alert. The exception does not change the request, invent final usage, release its funding reserve or alter any balance. Missing or invalid configuration fails closed. A reviewed exception is an operational disposition; the provider cost remains unknown.
+
 ## Current operating findings
 
 On October 11, seven October 3–9 conversations remained unresolved, with 19 minutes 12 seconds reserved. Observer-only recovery attempts returned HTTP 503 for all seven and no final usage. Another 22 assessment/meaning requests from September 16–October 10 had uncertain usage, no saved provider response identifier and no customer cash reservation. They were missing from the previous monitor. No usage or hold was changed by the investigation.
