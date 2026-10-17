@@ -69,7 +69,7 @@ for (const environment of ['live','test'] as const) integration(`Apple ${environ
     calls.push({start,end,token});
     assert.ok(end-start<=7*day);
     if(fail)throw new Error('timeout');
-    return {scheduled:0};
+    return {scheduled:0,nextPageToken:undefined};
   }};
   const row=async()=>(await f.db.query('SELECT * FROM apple_notification_cursors')).rows[0];
   try {
