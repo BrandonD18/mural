@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { connectDatabase } from '../src/db.js';
@@ -61,6 +61,59 @@ integration('Apple authorization failures survive rollback, identify the scope, 
     assert.ok((await f.db.query('SELECT completed_through_ms FROM apple_notification_cursors')).rows[0].completed_through_ms);
   } finally {await f.cleanup();}
 });
+for (const environment of ['live','test'] as const) integration(`Apple ${environment} catch-up covers retention without gaps and resumes after a failed window`, async () => {
+  const f=await fixture(),day=86_400_000,started=Date.now();
+  const calls:Array<{start:number;end:number;token?:string}>=[];
+  let fail=false;
+  const source={environment,merchant:'chat.mural.ios',async pollHistory(start:number,end:number,token?:string){
+    calls.push({start,end,token});
+    assert.ok(end-start<=7*day);
+    if(fail)throw new Error('timeout');
+    return {scheduled:0,nextPageToken:undefined};
+  }};
+  const row=async()=>(await f.db.query('SELECT * FROM apple_notification_cursors')).rows[0];
+  try {
+    assert.equal((await new AppleHistoryReconciler(f.db,source).page()).more,true);
+    assert.ok(Math.abs(calls[0]!.start-(started-(environment==='live'?179:29)*day))<5000);
+    const first=await row();
+    assert.equal(Number(first.completed_through_ms),calls[0]!.end);
+    assert.equal(first.page_token,null);
+    fail=true;await assert.rejects(new AppleHistoryReconciler(f.db,source).page());
+    assert.deepEqual(await row(),first);
+    fail=false;
+    let more=true,remaining=40;
+    while(more && remaining--){more=(await new AppleHistoryReconciler(f.db,source).page()).more;}
+    assert.ok(remaining>0);assert.equal(more,false);
+    assert.deepEqual(calls[2],calls[1]); // restart retries the uncompleted window
+    for(let i=3;i<calls.length;i++){
+      assert.equal(calls[i]!.start,calls[i-1]!.end-300_000);
+      assert.ok(calls[i]!.end>calls[i-1]!.end);
+    }
+    assert.ok(Number((await row()).completed_through_ms)>Date.now()-120_000);
+    assert.deepEqual(await new AppleHistoryReconciler(f.db,source).page(),{pages:0,scheduled:0,more:false});
+  } finally {await f.cleanup();}
+});
+
+integration('Apple finishes a recent paginated window when the clock advances between pages', async () => {
+  const f=await fixture(),started=Date.now();let now=started;
+  const clock=mock.method(Date,'now',()=>now),calls:Array<{start:number;end:number;token?:string}>=[];
+  try {
+    await f.db.query("INSERT INTO apple_notification_cursors(environment,merchant,completed_through_ms) VALUES('live','chat.mural.ios',$1)",[started-600_000]);
+    const cursor=new AppleHistoryReconciler(f.db,{environment:'live',merchant:'chat.mural.ios',pollHistory:async(start,end,token)=>{
+      calls.push({start,end,token});return {scheduled:0,nextPageToken:token?undefined:'last-page'};
+    }});
+    assert.equal((await cursor.page()).more,true);
+    now+=60_000;
+    assert.equal((await cursor.page()).more,false);
+    assert.equal(calls[1]!.start,calls[0]!.start);assert.equal(calls[1]!.end,calls[0]!.end);
+    const row=(await f.db.query('SELECT * FROM apple_notification_cursors')).rows[0];
+    assert.equal(Number(row.completed_through_ms),started-60_000);
+    assert.equal(row.page_token,null);
+    assert.deepEqual(await cursor.page(),{pages:0,scheduled:0,more:false});
+    assert.equal(calls.length,2);
+  } finally {clock.mock.restore();await f.cleanup();}
+});
+
 async function fixture() {
   const schema = `commerce_runner_${randomUUID().replaceAll('-', '')}`, url = new URL(databaseURL!);
   url.searchParams.set('options', `-c search_path=${schema}`);
