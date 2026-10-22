@@ -1,0 +1,56 @@
+name: Sideload IPA
+# Builds an unsigned Mural.ipa for installing with Sideloadly (or AltStore) from Windows.
+# Sideloadly re-signs it with your own Apple ID, so no certificates live here.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sideload-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Select newest Xcode 26
+        run: |
+          ls -d /Applications/Xcode*.app
+          XCODE=$(ls -d /Applications/Xcode_26*.app | sort -V | tail -1)
+          sudo xcode-select -s "$XCODE"
+          xcodebuild -version
+      # Accounts, Sign in with Apple and purchases need a paid team or Mural's server,
+      # so this build is bring-your-own-key only.
+      - name: Build unsigned app
+        run: |
+          xcodebuild -project apps/ios/Mural.xcodeproj -scheme Mural -configuration Release \
+            -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            MURAL_MANAGED_ACCOUNTS_ENABLED=NO MURAL_GOOGLE_SIGN_IN_ENABLED=NO \
+            MURAL_APPLE_SIGN_IN_ENABLED=NO MURAL_APPLE_SWIFT_FLAGS= MURAL_APPLE_ENTITLEMENTS= \
+            MURAL_APPLE_PURCHASES_ENABLED=NO \
+            build 2>&1 | tee build.log | grep -E "error:|warning: .*deprecated|BUILD (SUCCEEDED|FAILED)" || true
+          test -d build/Build/Products/Release-iphoneos/Mural.app
+      - name: Package IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/Mural.app Payload/
+          zip -qry Mural.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Mural-ipa
+          path: Mural.ipa
+          retention-days: 30
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: build-log
+          path: build.log
