@@ -81,8 +81,8 @@ import AVFoundation
         case "session.commentary.append":
             if let id = event["delegation_id"] as? String, let name = pendingCalls.removeValue(forKey: id) {
                 send(["toolResponse": ["functionResponses": [["id": id, "name": name, "response": ["result": content]]]]])
-            } else { note(content, respond: true) }
-        case "session.thinking.append": note(content, respond: false)
+            } else { note("Say this reply to the learner now, in your own voice: " + content, respond: true) }
+        case "session.thinking.append": note("Context only, do not answer yet: " + content, respond: false)
         case "session.instructions.append": note(content, respond: true)
         default: return false
         }
