@@ -38,6 +38,7 @@ struct HostedConnectRequest {
     private var hostedLease: HostedLease?
     private var hostedClient: HostedClient?
     private var hostedCloseRequested = false
+    private var gemini: GeminiLiveSession?
 
     func connect(api: APIClient, instructions: String, history: [[String: Any]], hosted: HostedConnectRequest? = nil) async throws {
         disconnect()
@@ -48,6 +49,23 @@ struct HostedConnectRequest {
         guard granted else { throw TransportError.microphone }
         try Task.checkCancellation()
         guard attempt == token else { throw CancellationError() }
+        if hosted == nil, let key = api.geminiKey() {
+            let session = GeminiLiveSession()
+            gemini = session; isMuted = false
+            session.onEvent = { [weak self] event in
+                guard let self, self.gemini === session else { return }
+                if event["type"] as? String == "session.started" { self.started = true }
+                self.onEvent?(event)
+            }
+            session.onLevels = { [weak self] input, output in self?.onLevels?(input, output) }
+            session.onFailure = { [weak self] message in
+                guard let self, self.gemini === session, !self.closing else { return }
+                self.onFailure?(message)
+            }
+            try await session.connect(key: key, instructions: instructions, history: history)
+            guard attempt == token else { throw CancellationError() }
+            return
+        }
         // WebRTC reapplies this configuration when its audio unit starts.
         // Setting AVAudioSession alone loses the speaker preference at that point.
         let audioConfiguration = RTCAudioSessionConfiguration()
@@ -132,21 +150,25 @@ struct HostedConnectRequest {
     }
 
     @discardableResult func send(_ event: [String: Any]) -> Bool {
+        if let gemini { return gemini.send(event: event) }
         guard let channel, channel.readyState == .open, let data = try? JSONSerialization.data(withJSONObject: event) else { return false }
         return channel.sendData(RTCDataBuffer(data: data, isBinary: false))
     }
     func mute(_ muted: Bool) {
+        if let gemini { isMuted = muted; gemini.mute(muted); return }
         isMuted = muted; localTrack?.isEnabled = !muted
         _ = send(["type": muted ? "session.input_audio.mute" : "session.input_audio.unmute", "event_id": UUID().uuidString])
     }
     func close() {
         networkRecovery.connected()
         closing = true; localTrack?.isEnabled = false; isMuted = true
+        if let gemini { gemini.close(); return }
         _ = send(["type": "session.close", "event_id": UUID().uuidString])
         closeHostedSession()
     }
     func disconnect() {
         networkRecovery.connected()
+        gemini?.stop(); gemini = nil
         closeHostedSession()
         hostedLease = nil; hostedClient = nil
         attempt = UUID(); meterTask?.cancel(); meterTask = nil

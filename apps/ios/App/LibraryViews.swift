@@ -520,7 +520,7 @@ private struct OpenAIKeyView: View {
                     Button("Remove key", role: .destructive) { removing = true }
                         .disabled(coordinator.isRunning)
                 }
-            } footer: { Text("No Mural minute limit. OpenAI bills your account for usage. The key stays in this iPhone’s Keychain and goes only to OpenAI.") }
+            } footer: { Text("Paste a free Google Gemini key (starts with AIza) or an OpenAI key (starts with sk-). Gemini’s free tier has daily limits; OpenAI bills your account. The key stays in this iPhone’s Keychain and goes only to that provider.") }
             if let failure = coordinator.personalKeyFailure {
                 Section("OpenAI issue") {
                     Text(failure.localizedDescription)
@@ -531,7 +531,8 @@ private struct OpenAIKeyView: View {
             }
             if let message { Section { Text(message).foregroundStyle(MuralColor.secondary) } }
             Section {
-                Link("Manage API keys", destination: URL(string: "https://platform.openai.com/api-keys")!)
+                Link("Get a free Gemini key", destination: URL(string: "https://aistudio.google.com/apikey")!)
+                Link("Manage OpenAI API keys", destination: URL(string: "https://platform.openai.com/api-keys")!)
                 Link("Usage and billing", destination: URL(string: "https://platform.openai.com/usage")!)
             }
         }.scrollContentBackground(.hidden).background(MuralColor.cream)

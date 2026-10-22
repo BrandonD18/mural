@@ -42,6 +42,11 @@ struct APIResult { var text: String; var sources: [SourceLink]; var usage: APIUs
         voiceCredential.credential(protectedDataAvailable: UIApplication.shared.isProtectedDataAvailable,
                                    readStored: CredentialStore.read)
     }
+    /// A saved Google AI Studio key selects Gemini; an OpenAI key keeps the original path.
+    func geminiKey() -> String? {
+        guard conversationProvider == .personalKey, let key = personalKey(), CredentialStore.isGemini(key) else { return nil }
+        return key
+    }
     init() {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 45; config.timeoutIntervalForResource = 60
@@ -89,6 +94,11 @@ struct APIResult { var text: String; var sources: [SourceLink]; var usage: APIUs
             onText?(result.text)
             return result
         }
+        if let key = geminiKey() {
+            let result = try await geminiResponse(key: key, instructions: instructions, input: input, schema: schema, search: search)
+            onText?(result.text)
+            return result
+        }
         var body: [String: Any] = ["model": "gpt-6-luna", "store": false, "instructions": instructions,
                                   "input": [["role": "user", "content": input]], "max_output_tokens": schema == nil ? 1400 : 2200,
                                   "reasoning": ["effort": "low"]]
@@ -114,6 +124,44 @@ struct APIResult { var text: String; var sources: [SourceLink]; var usage: APIUs
             }
         }
         if let u = json["usage"] as? [String: Any] { usage.input = u["input_tokens"] as? Int ?? 0; usage.output = u["output_tokens"] as? Int ?? 0 }
+        guard !text.isEmpty else { throw APIError.incomplete }
+        return APIResult(text: text, sources: sources, usage: usage)
+    }
+    /// Gemini 2.5 Flash: free tier, including daily Google Search grounding.
+    private func geminiResponse(key: String, instructions: String, input: String, schema: [String: Any]?, search: Bool) async throws -> APIResult {
+        var generation: [String: Any] = ["maxOutputTokens": schema == nil ? 1400 : 2200, "thinkingConfig": ["thinkingBudget": 0]]
+        if let schema { generation["responseMimeType"] = "application/json"; generation["responseJsonSchema"] = schema }
+        var body: [String: Any] = ["systemInstruction": ["parts": [["text": instructions]]],
+                                   "contents": [["role": "user", "parts": [["text": input]]]],
+                                   "generationConfig": generation]
+        if search { body["tools"] = [["google_search": [String: Any]()]] }
+        var request = URLRequest(url: URL(string: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent")!)
+        request.httpMethod = "POST"; request.setValue(key, forHTTPHeaderField: "x-goog-api-key")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await session.data(for: request)
+        try Task.checkCancellation()
+        guard let http = response as? HTTPURLResponse else { throw APIError.invalidResponse }
+        guard (200..<300).contains(http.statusCode) else { throw APIError.http(http.statusCode) }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw APIError.invalidResponse }
+        if (json["promptFeedback"] as? [String: Any])?["blockReason"] != nil { throw APIError.refused }
+        guard let candidate = (json["candidates"] as? [[String: Any]])?.first else { throw APIError.incomplete }
+        if ["SAFETY", "PROHIBITED_CONTENT", "BLOCKLIST", "SPII"].contains(candidate["finishReason"] as? String ?? "") { throw APIError.refused }
+        var text = "", sources: [SourceLink] = [], usage = APIUsage()
+        for part in (candidate["content"] as? [String: Any])?["parts"] as? [[String: Any]] ?? [] where part["thought"] as? Bool != true {
+            text += part["text"] as? String ?? ""
+        }
+        if let grounding = candidate["groundingMetadata"] as? [String: Any] {
+            if !(grounding["webSearchQueries"] as? [Any] ?? []).isEmpty { usage.searches += 1 }
+            for chunk in grounding["groundingChunks"] as? [[String: Any]] ?? [] {
+                guard let web = chunk["web"] as? [String: Any], let url = web["uri"] as? String else { continue }
+                let source = SourceLink(title: web["title"] as? String ?? "Source", url: url)
+                if source.safeURL != nil && !sources.contains(where: { $0.url == url }) { sources.append(source) }
+            }
+        }
+        if let u = json["usageMetadata"] as? [String: Any] {
+            usage.input = u["promptTokenCount"] as? Int ?? 0; usage.output = u["candidatesTokenCount"] as? Int ?? 0
+        }
         guard !text.isEmpty else { throw APIError.incomplete }
         return APIResult(text: text, sources: sources, usage: usage)
     }
@@ -163,13 +211,13 @@ struct APIResult { var text: String; var sources: [SourceLink]; var usage: APIUs
         case missingKey, invalidResponse, incomplete, refused, http(Int)
         var errorDescription: String? {
             switch self {
-            case .missingKey: "Add your OpenAI key in Settings to begin."
-            case .invalidResponse, .incomplete: "OpenAI returned an incomplete response. Please try again."
+            case .missingKey: "Add your Gemini or OpenAI key in Settings to begin."
+            case .invalidResponse, .incomplete: "The AI service returned an incomplete response. Please try again."
             case .refused: "Mural couldn’t complete that request. Try a different topic."
-            case .http(401): "Your OpenAI key wasn’t accepted. Check it in Settings."
-            case .http(403), .http(404): "This API key may not have access to the requested model. Check your OpenAI project."
-            case .http(429): "OpenAI’s usage or rate limit was reached. Check your project’s billing and limits."
-            case .http(let status): "OpenAI couldn’t complete the request (HTTP \(status)). Please try again."
+            case .http(400), .http(401): "Your API key wasn’t accepted. Check it in Settings."
+            case .http(403), .http(404): "This API key may not have access to the requested model."
+            case .http(429): "The free usage limit was reached for now. Try again later."
+            case .http(let status): "The AI service couldn’t complete the request (HTTP \(status)). Please try again."
             }
         }
     }
