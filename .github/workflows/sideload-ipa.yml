@@ -37,8 +37,8 @@ jobs:
             MURAL_MANAGED_ACCOUNTS_ENABLED=NO MURAL_GOOGLE_SIGN_IN_ENABLED=NO \
             MURAL_APPLE_SIGN_IN_ENABLED=NO MURAL_APPLE_SWIFT_FLAGS= MURAL_APPLE_ENTITLEMENTS= \
             MURAL_APPLE_PURCHASES_ENABLED=NO \
-            build 2>&1 | tee build.log | grep -E "error:|warning: .*deprecated|BUILD (SUCCEEDED|FAILED)" || true
-          test -d build/Build/Products/Release-iphoneos/Mural.app
+            build > build.log 2>&1 || { grep -E "error:" build.log | sort -u | head -60; exit 1; }
+          grep -E "BUILD SUCCEEDED" build.log
       - name: Package IPA
         run: |
           mkdir Payload
