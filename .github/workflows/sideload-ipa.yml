@@ -36,7 +36,7 @@ jobs:
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
             MURAL_MANAGED_ACCOUNTS_ENABLED=NO MURAL_GOOGLE_SIGN_IN_ENABLED=NO \
             MURAL_APPLE_SIGN_IN_ENABLED=NO MURAL_APPLE_SWIFT_FLAGS= MURAL_APPLE_ENTITLEMENTS= \
-            MURAL_APPLE_PURCHASES_ENABLED=NO \
+            MURAL_APPLE_PURCHASES_ENABLED=NO PRODUCT_BUNDLE_IDENTIFIER=com.brandond18.mural \
             build > build.log 2>&1 || { grep -E "error:" build.log | sort -u | head -60; exit 1; }
           grep -E "BUILD SUCCEEDED" build.log
       - name: Package IPA
